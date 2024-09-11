@@ -1,3 +1,3 @@
 ## CDN
 
-jsdelivr CDN
+jsdelivr unpkg CDN
