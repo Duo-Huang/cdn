@@ -21,9 +21,6 @@ on:
         type: boolean
         default: false
 
-permissions:
-  contents: write # required to push auto-generated release tags
-
 env:
   CDN_DOMAIN: ${{ vars.CDN_DOMAIN }}
 
@@ -34,7 +31,7 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4.2.2
         with:
-          fetch-depth: 0
+          fetch-depth: 2
 
       - name: Detect changed asset files
         id: diff
@@ -62,42 +59,28 @@ jobs:
         if: steps.diff.outputs.count == '0'
         run: echo "No asset files changed, skipping."
 
-      # Auto-generate a timestamped release tag so jsDelivr serves brand-new content.
-      # New tag = new jsDelivr cache key = jsDelivr is forced to fetch fresh from GitHub.
-      - name: Create and push release tag
-        if: steps.diff.outputs.count != '0'
-        id: tag
-        run: |
-          TAG="v$(date -u +'%Y%m%d-%H%M%S')-${GITHUB_SHA:0:7}"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
-          git config user.name "github-actions[bot]"
-          git tag "$TAG"
-          git push origin "$TAG"
-          echo "tag=$TAG" >> $GITHUB_OUTPUT
-          echo "Created tag: $TAG"
-
-      # Write the new tag to Workers KV.
-      # The Worker reads this on every Cloudflare cache miss to build the jsDelivr URL.
-      - name: Update Workers KV (CURRENT_TAG)
+      # Write the current commit SHA (short) to Workers KV.
+      # Worker uses it to build jsDelivr URL: @{sha}/path
+      # New commit SHA = new jsDelivr cache key → jsDelivr always fetches fresh from GitHub.
+      # jsDelivr officially supports commit SHA refs and caches them permanently (immutable).
+      - name: Update Workers KV (CURRENT_SHA)
         if: steps.diff.outputs.count != '0'
         run: |
-          TAG="${{ steps.tag.outputs.tag }}"
-          echo "Writing CURRENT_TAG=${TAG} to KV..."
+          SHA="${GITHUB_SHA:0:7}"
+          echo "Writing CURRENT_SHA=${SHA} to KV..."
           curl -sf -X PUT \
-            "https://api.cloudflare.com/client/v4/accounts/${{ secrets.CF_ACCOUNT_ID }}/storage/kv/namespaces/${{ secrets.CF_KV_NAMESPACE_ID }}/values/CURRENT_TAG" \
+            "https://api.cloudflare.com/client/v4/accounts/${{ secrets.CF_ACCOUNT_ID }}/storage/kv/namespaces/${{ secrets.CF_KV_NAMESPACE_ID }}/values/CURRENT_SHA" \
             -H "Authorization: Bearer ${{ secrets.CF_API_TOKEN }}" \
             -H "Content-Type: text/plain" \
-            --data "$TAG"
+            --data "$SHA"
 
-      # Allow time for:
-      #   1. KV write to propagate globally (~1s, but give extra margin)
-      #   2. GitHub to register the new tag so jsDelivr can resolve it
-      - name: Wait for propagation
+      # Wait for KV write to propagate to all Cloudflare edge nodes.
+      - name: Wait for KV propagation
         if: steps.diff.outputs.count != '0'
-        run: sleep 10
+        run: sleep 5
 
       # Purge Cloudflare cache to invalidate stale content.
-      # On the next request: Cloudflare miss → Worker reads KV (new tag) → jsDelivr@{new_tag} → fresh content.
+      # On the next request: Cloudflare miss → Worker reads KV (new SHA) → jsDelivr@{sha} → fresh content.
       - name: Purge Cloudflare cache
         if: steps.diff.outputs.count != '0'
         run: |
