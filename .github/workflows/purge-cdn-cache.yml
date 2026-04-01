@@ -39,21 +39,32 @@ jobs:
           FORCE="${{ github.event.inputs.force }}"
 
           if [ "$FORCE" = "true" ]; then
+            # Force mode: treat all tracked files as "to process"
             git ls-files \
               | grep -vE '^(\.github/|README\.md|package\.json)' \
               > changed_files.txt
             echo "Mode: force (all files)"
           else
-            git diff --name-only HEAD~1 HEAD \
+            # Incremental mode: only Added / Copied / Modified / Renamed / Type-changed files.
+            # --diff-filter excludes Deleted (D) files so we never try to purge a URL
+            # that no longer exists in the repo (would cause Cloudflare API 400 → exit 22).
+            git diff --name-only --diff-filter=ACMRT HEAD~1 HEAD \
               | grep -vE '^(\.github/|README\.md|package\.json)' \
               > changed_files.txt || true
             echo "Mode: incremental (changed files only)"
           fi
 
-          echo "=== Files to process ==="
+          COUNT=$(wc -l < changed_files.txt | tr -d ' ')
+          echo "=== Files to process (${COUNT}) ==="
           cat changed_files.txt
-          echo "count=$(wc -l < changed_files.txt | tr -d ' ')" >> $GITHUB_OUTPUT
-          echo "force=${FORCE:-false}" >> $GITHUB_OUTPUT
+          echo "count=${COUNT}" >> $GITHUB_OUTPUT
+
+          # Use purge_everything when: force mode OR file count exceeds Cloudflare's 30-URL limit.
+          if [ "$FORCE" = "true" ] || [ "$COUNT" -gt 30 ]; then
+            echo "purge_everything=true" >> $GITHUB_OUTPUT
+          else
+            echo "purge_everything=false" >> $GITHUB_OUTPUT
+          fi
 
       - name: Skip if no asset changes
         if: steps.diff.outputs.count == '0'
@@ -85,16 +96,17 @@ jobs:
       - name: Purge Cloudflare cache
         if: steps.diff.outputs.count != '0'
         run: |
-          if [ "${{ steps.diff.outputs.force }}" = "true" ]; then
-            echo "Force mode: purging everything on Cloudflare..."
+          if [ "${{ steps.diff.outputs.purge_everything }}" = "true" ]; then
+            echo "Purging everything on Cloudflare (force or >30 files)..."
             curl -sf -X POST \
               "https://api.cloudflare.com/client/v4/zones/${{ secrets.CF_ZONE_ID }}/purge_cache" \
               -H "Authorization: Bearer ${{ secrets.CF_API_TOKEN }}" \
               -H "Content-Type: application/json" \
               --data '{"purge_everything": true}'
           else
+            # Build a valid JSON array: one quoted URL per line, joined by commas.
             URLS_JSON=$(
-              awk -v domain="$CDN_DOMAIN" '{printf "\"https://%s/%s\"", domain, $0}' changed_files.txt \
+              awk -v domain="$CDN_DOMAIN" '{printf "\"https://%s/%s\"\n", domain, $0}' changed_files.txt \
                 | paste -sd',' \
                 | sed 's/^/[/' \
                 | sed 's/$/]/'
@@ -107,15 +119,3 @@ jobs:
               --data "{\"files\": $URLS_JSON}"
           fi
 
-      # Warm up: pre-populate Cloudflare cache with the fresh content.
-      # This ensures the first real user request is a cache HIT, not a miss.
-      - name: Warm up Cloudflare cache
-        if: steps.diff.outputs.count != '0'
-        run: |
-          while IFS= read -r file; do
-            url="https://${CDN_DOMAIN}/${file}"
-            echo "Warming: $url"
-            curl -s -o /dev/null -w "  → HTTP %{http_code}\n" "$url" &
-          done < changed_files.txt
-          wait
-          echo "Warm-up complete."
