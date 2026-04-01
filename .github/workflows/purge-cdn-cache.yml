@@ -1,0 +1,137 @@
+# Required GitHub Secrets:
+#   CF_API_TOKEN        — Cloudflare API Token (permissions: Cache Purge + Workers KV Storage Write)
+#   CF_ZONE_ID          — Zone ID for yourdomain.com (Cloudflare dashboard → Overview → Zone ID)
+#   CF_ACCOUNT_ID       — Cloudflare Account ID (Cloudflare dashboard → Overview → Account ID)
+#   CF_KV_NAMESPACE_ID  — Workers KV Namespace ID
+#                         Setup: cd cloudflare-infra/workers/cdn && wrangler kv namespace create CDN_KV
+#
+# Required GitHub Variables:
+#   CDN_DOMAIN          — e.g. cdn.yourdomain.com
+
+name: Purge CDN Cache
+
+on:
+  push:
+    branches:
+      - master
+  workflow_dispatch:
+    inputs:
+      force:
+        description: "Force purge all cached files (for testing)"
+        type: boolean
+        default: false
+
+permissions:
+  contents: write # required to push auto-generated release tags
+
+env:
+  CDN_DOMAIN: ${{ vars.CDN_DOMAIN }}
+
+jobs:
+  purge:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4.2.2
+        with:
+          fetch-depth: 0
+
+      - name: Detect changed asset files
+        id: diff
+        run: |
+          FORCE="${{ github.event.inputs.force }}"
+
+          if [ "$FORCE" = "true" ]; then
+            git ls-files \
+              | grep -vE '^(\.github/|README\.md|package\.json)' \
+              > changed_files.txt
+            echo "Mode: force (all files)"
+          else
+            git diff --name-only HEAD~1 HEAD \
+              | grep -vE '^(\.github/|README\.md|package\.json)' \
+              > changed_files.txt || true
+            echo "Mode: incremental (changed files only)"
+          fi
+
+          echo "=== Files to process ==="
+          cat changed_files.txt
+          echo "count=$(wc -l < changed_files.txt | tr -d ' ')" >> $GITHUB_OUTPUT
+          echo "force=${FORCE:-false}" >> $GITHUB_OUTPUT
+
+      - name: Skip if no asset changes
+        if: steps.diff.outputs.count == '0'
+        run: echo "No asset files changed, skipping."
+
+      # Auto-generate a timestamped release tag so jsDelivr serves brand-new content.
+      # New tag = new jsDelivr cache key = jsDelivr is forced to fetch fresh from GitHub.
+      - name: Create and push release tag
+        if: steps.diff.outputs.count != '0'
+        id: tag
+        run: |
+          TAG="v$(date -u +'%Y%m%d-%H%M%S')-${GITHUB_SHA:0:7}"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git config user.name "github-actions[bot]"
+          git tag "$TAG"
+          git push origin "$TAG"
+          echo "tag=$TAG" >> $GITHUB_OUTPUT
+          echo "Created tag: $TAG"
+
+      # Write the new tag to Workers KV.
+      # The Worker reads this on every Cloudflare cache miss to build the jsDelivr URL.
+      - name: Update Workers KV (CURRENT_TAG)
+        if: steps.diff.outputs.count != '0'
+        run: |
+          TAG="${{ steps.tag.outputs.tag }}"
+          echo "Writing CURRENT_TAG=${TAG} to KV..."
+          curl -sf -X PUT \
+            "https://api.cloudflare.com/client/v4/accounts/${{ secrets.CF_ACCOUNT_ID }}/storage/kv/namespaces/${{ secrets.CF_KV_NAMESPACE_ID }}/values/CURRENT_TAG" \
+            -H "Authorization: Bearer ${{ secrets.CF_API_TOKEN }}" \
+            -H "Content-Type: text/plain" \
+            --data "$TAG"
+
+      # Allow time for:
+      #   1. KV write to propagate globally (~1s, but give extra margin)
+      #   2. GitHub to register the new tag so jsDelivr can resolve it
+      - name: Wait for propagation
+        if: steps.diff.outputs.count != '0'
+        run: sleep 10
+
+      # Purge Cloudflare cache to invalidate stale content.
+      # On the next request: Cloudflare miss → Worker reads KV (new tag) → jsDelivr@{new_tag} → fresh content.
+      - name: Purge Cloudflare cache
+        if: steps.diff.outputs.count != '0'
+        run: |
+          if [ "${{ steps.diff.outputs.force }}" = "true" ]; then
+            echo "Force mode: purging everything on Cloudflare..."
+            curl -sf -X POST \
+              "https://api.cloudflare.com/client/v4/zones/${{ secrets.CF_ZONE_ID }}/purge_cache" \
+              -H "Authorization: Bearer ${{ secrets.CF_API_TOKEN }}" \
+              -H "Content-Type: application/json" \
+              --data '{"purge_everything": true}'
+          else
+            URLS_JSON=$(
+              awk -v domain="$CDN_DOMAIN" '{printf "\"https://%s/%s\"", domain, $0}' changed_files.txt \
+                | paste -sd',' \
+                | sed 's/^/[/' \
+                | sed 's/$/]/'
+            )
+            echo "Purging Cloudflare URLs: $URLS_JSON"
+            curl -sf -X POST \
+              "https://api.cloudflare.com/client/v4/zones/${{ secrets.CF_ZONE_ID }}/purge_cache" \
+              -H "Authorization: Bearer ${{ secrets.CF_API_TOKEN }}" \
+              -H "Content-Type: application/json" \
+              --data "{\"files\": $URLS_JSON}"
+          fi
+
+      # Warm up: pre-populate Cloudflare cache with the fresh content.
+      # This ensures the first real user request is a cache HIT, not a miss.
+      - name: Warm up Cloudflare cache
+        if: steps.diff.outputs.count != '0'
+        run: |
+          while IFS= read -r file; do
+            url="https://${CDN_DOMAIN}/${file}"
+            echo "Warming: $url"
+            curl -s -o /dev/null -w "  → HTTP %{http_code}\n" "$url" &
+          done < changed_files.txt
+          wait
+          echo "Warm-up complete."
